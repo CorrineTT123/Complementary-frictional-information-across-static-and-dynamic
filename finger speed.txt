@@ -1,0 +1,141 @@
+import cv2
+import mediapipe as mp
+import numpy as np
+import csv
+import matplotlib.pyplot as plt
+
+
+mp_hands = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
+hands = mp_hands.Hands(static_image_mode=False, max_num_hands=2, min_detection_confidence=0.5)
+
+
+cap = cv2.VideoCapture("2.mp4")
+fps = cap.get(cv2.CAP_PROP_FPS)
+width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+out = cv2.VideoWriter('output_with_tracking.mp4', fourcc, fps, (width, height))
+
+with open("pixel_to_cm_ratio.txt", "r") as f:
+    lines = f.readlines()
+    for line in lines:
+        if "cm_per_pixel" in line:
+            cm_per_pixel = float(line.strip().split("=")[1])
+
+trajectory = []
+last_point = None
+stay_time = 0.0
+move_time = 0.0
+stay_threshold = 4.0
+min_stay_duration = int(fps * 0.15)
+stay_counter = 0
+stop_points = []
+total_stops = 0
+in_stop = False
+
+chosen_hand_index = None
+initialized = False
+frame_index = 0
+
+while cap.isOpened():
+    success, frame = cap.read()
+    if not success:
+        break
+
+    image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = hands.process(image_rgb)
+
+    if results.multi_hand_landmarks:
+        if not initialized:
+            first_frame = frame.copy()
+            chosen_hand = min(results.multi_hand_landmarks, key=lambda h: h.landmark[8].y)
+            chosen_hand_index = results.multi_hand_landmarks.index(chosen_hand)
+            initialized = True
+
+        if chosen_hand_index < len(results.multi_hand_landmarks):
+            hand_landmarks = results.multi_hand_landmarks[chosen_hand_index]
+            mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+
+            tip = hand_landmarks.landmark[8]
+            x_px, y_px = int(tip.x * width), int(tip.y * height)
+            trajectory.append((x_px, y_px))
+
+            if last_point is not None:
+                dist = np.linalg.norm(np.array([x_px, y_px]) - np.array(last_point))
+                if dist < stay_threshold:
+                    stay_counter += 1
+                    stay_time += 1 / fps
+                    if stay_counter >= min_stay_duration and not in_stop:
+                        stop_points.append((x_px, y_px))
+                        total_stops += 1
+                        in_stop = True
+                else:
+                    move_time += 1 / fps
+                    stay_counter = 0
+                    in_stop = False
+            last_point = (x_px, y_px)
+
+    for i in range(1, len(trajectory)):
+        cv2.line(frame, trajectory[i - 1], trajectory[i], (255, 0, 0), 2)
+    for pt in stop_points:
+        cv2.circle(frame, pt, 8, (0, 0, 255), 3)
+
+    out.write(frame)
+    frame_index += 1
+
+cap.release()
+out.release()
+hands.close()
+cv2.destroyAllWindows()
+
+
+speed_data_cm = []
+time_series = []
+raw_stop_flags = []
+for i in range(1, len(trajectory)):
+    x1, y1 = trajectory[i - 1]
+    x2, y2 = trajectory[i]
+    dist_px = np.linalg.norm(np.array([x2, y2]) - np.array([x1, y1]))
+    dist_cm = dist_px * cm_per_pixel
+    speed_cm = dist_cm * fps
+    time = i / fps
+    time_series.append(time)
+    speed_data_cm.append(speed_cm)
+    if dist_px < stay_threshold:
+        raw_stop_flags.append(1)
+    else:
+        raw_stop_flags.append(0)
+
+def smooth_preserve_zeros(speed_list, window=5):
+    smoothed = []
+    half = window // 2
+    for i in range(len(speed_list)):
+        if speed_list[i] == 0:
+            smoothed.append(0)
+        else:
+            left = max(i - half, 0)
+            right = min(i + half + 1, len(speed_list))
+            window_vals = [v for v in speed_list[left:right] if v != 0]
+            avg = sum(window_vals) / len(window_vals) if window_vals else 0
+            smoothed.append(avg)
+    return smoothed
+
+smoothed_speed = smooth_preserve_zeros(speed_data_cm)
+
+
+total_stay_frames = sum(raw_stop_flags)
+total_stay_time = total_stay_frames / fps
+
+
+with open("finger_speed_cm_with_stop.csv", "w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow(["time_s", "raw_speed_cm_s", "smoothed_speed_cm_s", "is_stop"])
+    for i in range(len(speed_data_cm)):
+        writer.writerow([round(time_series[i], 2), round(speed_data_cm[i], 2), round(smoothed_speed[i], 2), raw_stop_flags[i]])
+
+print("finger_speed_cm_with_stop.csv")
+print(f"dwelling time: {total_stay_time:.2f} s")
+print(f"sliding time: {move_time:.2f} s")
+print(f"number of dwelling: {total_stops} ")

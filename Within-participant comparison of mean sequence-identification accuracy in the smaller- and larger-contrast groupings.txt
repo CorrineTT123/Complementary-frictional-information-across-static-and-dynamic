@@ -1,0 +1,893 @@
+import pandas as pd
+import numpy as np
+from scipy import stats
+import os
+
+# ============================================================
+# 0. File paths
+# ============================================================
+
+input_file = r"subject trail.xlsx"
+output_file = r"Fig2_new_GH_plot_data.xlsx"
+
+
+# ============================================================
+# 1. Read all participant sheets and merge
+# ============================================================
+
+xls = pd.ExcelFile(input_file)
+
+all_data = []
+
+for sheet_name in xls.sheet_names:
+
+    df = pd.read_excel(
+        input_file,
+        sheet_name=sheet_name
+    )
+
+    # keep source sheet for audit
+    df["source_sheet"] = sheet_name
+
+    all_data.append(df)
+
+
+master = pd.concat(
+    all_data,
+    ignore_index=True
+)
+
+print("======================================")
+print("Master data loaded")
+print("Total trials:", len(master))
+print("Participants:", master["subj"].nunique())
+print("======================================")
+
+
+# ============================================================
+# 2. Clean key text columns
+# ============================================================
+
+text_cols = [
+    "subj",
+    "pair",
+    "matA",
+    "matB",
+    "order",
+    "task",
+    "response"
+]
+
+for col in text_cols:
+
+    master[col] = (
+        master[col]
+        .astype(str)
+        .str.strip()
+    )
+
+
+# ============================================================
+# 3. Recalculate exact-match correctness
+#
+# Only full exact match is correct:
+#
+# True AB, response AB -> 1
+# True AB, response AA -> 0
+# True AB, response BA -> 0
+# True AB, response BB -> 0
+# ============================================================
+
+master["exact_correct"] = (
+    master["response"]
+    ==
+    master["order"]
+).astype(int)
+
+
+# ============================================================
+# 4. Check original correct column
+# ============================================================
+
+if "correct" in master.columns:
+
+    master["correct_match"] = (
+        master["correct"].astype(int)
+        ==
+        master["exact_correct"]
+    )
+
+    mismatch = master[
+        master["correct_match"] == False
+    ].copy()
+
+    print(
+        "Correct mismatches:",
+        len(mismatch)
+    )
+
+else:
+
+    mismatch = pd.DataFrame()
+
+    print(
+        "No original 'correct' column found."
+    )
+
+
+# ============================================================
+# 5. Define material pair label
+# ============================================================
+
+master["material_pair"] = (
+    master["matA"]
+    +
+    "–"
+    +
+    master["matB"]
+)
+
+
+# ============================================================
+# 6. Classify larger/smaller friction contrast
+#
+# Dcue = dynamic-friction task
+# Scue = static-friction task
+#
+# If Δμd > Δμs:
+# dynamic task = larger contrast
+#
+# If Δμs > Δμd:
+# static task = larger contrast
+# ============================================================
+
+def classify_contrast(row):
+
+    delta_s = float(row["delta_mu_s"])
+    delta_d = float(row["delta_mu_d"])
+
+    if delta_d > delta_s:
+
+        if row["task"] == "Dcue":
+            return "Larger contrast"
+
+        elif row["task"] == "Scue":
+            return "Smaller contrast"
+
+    elif delta_s > delta_d:
+
+        if row["task"] == "Scue":
+            return "Larger contrast"
+
+        elif row["task"] == "Dcue":
+            return "Smaller contrast"
+
+    return "Equal contrast"
+
+
+master["contrast_condition"] = (
+    master.apply(
+        classify_contrast,
+        axis=1
+    )
+)
+
+
+# ============================================================
+# 7. FIG. 2g
+#
+# For every participant:
+#
+# mean exact accuracy under
+# - Smaller friction contrast
+# - Larger friction contrast
+#
+# ============================================================
+
+fig2g_long = (
+    master
+    .groupby(
+        [
+            "subj",
+            "contrast_condition"
+        ],
+        as_index=False
+    )
+    ["exact_correct"]
+    .mean()
+)
+
+fig2g_long["accuracy_percent"] = (
+    fig2g_long["exact_correct"]
+    *
+    100
+)
+
+
+# Convert to wide table:
+#
+# participant
+# smaller
+# larger
+# gain
+#
+fig2g_participant = (
+    fig2g_long
+    .pivot(
+        index="subj",
+        columns="contrast_condition",
+        values="accuracy_percent"
+    )
+    .reset_index()
+)
+
+fig2g_participant.columns.name = None
+
+
+fig2g_participant[
+    "Complementarity_gain_pp"
+] = (
+
+    fig2g_participant[
+        "Larger contrast"
+    ]
+
+    -
+
+    fig2g_participant[
+        "Smaller contrast"
+    ]
+)
+
+
+# ============================================================
+# 8. Fig. 2g group summary
+# ============================================================
+
+g_summary_rows = []
+
+for condition in [
+    "Smaller contrast",
+    "Larger contrast"
+]:
+
+    vals = (
+        fig2g_participant[
+            condition
+        ]
+        .dropna()
+        .to_numpy(dtype=float)
+    )
+
+    n = len(vals)
+
+    mean = np.mean(vals)
+    sd = np.std(vals, ddof=1)
+    sem = stats.sem(vals)
+
+    ci_half = (
+        stats.t.ppf(
+            0.975,
+            n - 1
+        )
+        *
+        sem
+    )
+
+    g_summary_rows.append({
+
+        "Condition":
+            condition,
+
+        "N_participants":
+            n,
+
+        "Mean_accuracy_percent":
+            mean,
+
+        "SD":
+            sd,
+
+        "SEM":
+            sem,
+
+        "CI95_lower":
+            mean - ci_half,
+
+        "CI95_upper":
+            mean + ci_half
+    })
+
+
+fig2g_summary = pd.DataFrame(
+    g_summary_rows
+)
+
+
+# ============================================================
+# 9. Fig. 2g paired gain statistics
+# ============================================================
+
+smaller = (
+    fig2g_participant[
+        "Smaller contrast"
+    ]
+    .to_numpy(dtype=float)
+)
+
+larger = (
+    fig2g_participant[
+        "Larger contrast"
+    ]
+    .to_numpy(dtype=float)
+)
+
+gain = larger - smaller
+
+n = len(gain)
+
+mean_gain = np.mean(gain)
+sd_gain = np.std(gain, ddof=1)
+sem_gain = stats.sem(gain)
+
+ci_gain_half = (
+    stats.t.ppf(
+        0.975,
+        n - 1
+    )
+    *
+    sem_gain
+)
+
+t_result = stats.ttest_rel(
+    larger,
+    smaller
+)
+
+
+try:
+
+    wilcoxon_result = (
+        stats.wilcoxon(
+            larger,
+            smaller
+        )
+    )
+
+    wilcoxon_p = (
+        wilcoxon_result.pvalue
+    )
+
+except:
+
+    wilcoxon_p = np.nan
+
+
+fig2g_stats = pd.DataFrame({
+
+    "Metric": [
+
+        "Mean smaller accuracy (%)",
+        "Mean larger accuracy (%)",
+
+        "Mean gain (pp)",
+
+        "Gain CI95 lower",
+        "Gain CI95 upper",
+
+        "Paired t",
+        "Degrees of freedom",
+        "Paired t-test P",
+
+        "Wilcoxon P",
+
+        "Participants positive",
+        "Participants unchanged",
+        "Participants negative"
+    ],
+
+    "Value": [
+
+        np.mean(smaller),
+        np.mean(larger),
+
+        mean_gain,
+
+        mean_gain - ci_gain_half,
+        mean_gain + ci_gain_half,
+
+        t_result.statistic,
+        n - 1,
+        t_result.pvalue,
+
+        wilcoxon_p,
+
+        np.sum(gain > 0),
+        np.sum(gain == 0),
+        np.sum(gain < 0)
+    ]
+})
+
+
+# ============================================================
+# 10. FIG. 2h
+#
+# Behavioural two-dimensional discriminability space
+#
+# x = Static-task accuracy
+# y = Dynamic-task accuracy
+#
+# Every participant × material pair gives one point
+# ============================================================
+
+pair_task = (
+    master
+    .groupby(
+        [
+            "subj",
+            "pair",
+            "material_pair",
+            "matA",
+            "matB",
+            "task",
+            "delta_mu_s",
+            "delta_mu_d"
+        ],
+        as_index=False
+    )
+    ["exact_correct"]
+    .mean()
+)
+
+
+pair_task[
+    "accuracy_percent"
+] = (
+
+    pair_task[
+        "exact_correct"
+    ]
+    *
+    100
+)
+
+
+# ============================================================
+# 11. Pivot static and dynamic task accuracies
+#
+# One row =
+# one participant × one material pair
+# ============================================================
+
+fig2h_participant_pair = (
+
+    pair_task
+    .pivot_table(
+
+        index=[
+
+            "subj",
+            "pair",
+            "material_pair",
+            "matA",
+            "matB",
+            "delta_mu_s",
+            "delta_mu_d"
+        ],
+
+        columns="task",
+
+        values="accuracy_percent"
+
+    )
+
+    .reset_index()
+)
+
+
+fig2h_participant_pair.columns.name = None
+
+
+# Rename task columns clearly
+fig2h_participant_pair = (
+    fig2h_participant_pair
+    .rename(
+        columns={
+
+            "Scue":
+                "Static_accuracy_percent",
+
+            "Dcue":
+                "Dynamic_accuracy_percent"
+        }
+    )
+)
+
+
+# ============================================================
+# 12. Fig. 2h pair-level mean + horizontal/vertical CI
+#
+# Every material pair gives one large point
+#
+# x mean = static accuracy
+# y mean = dynamic accuracy
+#
+# horizontal CI = static 95% CI
+# vertical CI = dynamic 95% CI
+# ============================================================
+
+h_summary_rows = []
+
+for pair, subdf in (
+    fig2h_participant_pair
+    .groupby(
+        "pair",
+        sort=False
+    )
+):
+
+    static_vals = (
+        subdf[
+            "Static_accuracy_percent"
+        ]
+        .to_numpy(dtype=float)
+    )
+
+    dynamic_vals = (
+        subdf[
+            "Dynamic_accuracy_percent"
+        ]
+        .to_numpy(dtype=float)
+    )
+
+    n = len(subdf)
+
+
+    # ---------------------
+    # static axis statistics
+    # ---------------------
+
+    static_mean = np.mean(
+        static_vals
+    )
+
+    static_sd = np.std(
+        static_vals,
+        ddof=1
+    )
+
+    static_sem = stats.sem(
+        static_vals
+    )
+
+    static_ci_half = (
+
+        stats.t.ppf(
+            0.975,
+            n - 1
+        )
+
+        *
+
+        static_sem
+    )
+
+
+    # ---------------------
+    # dynamic axis statistics
+    # ---------------------
+
+    dynamic_mean = np.mean(
+        dynamic_vals
+    )
+
+    dynamic_sd = np.std(
+        dynamic_vals,
+        ddof=1
+    )
+
+    dynamic_sem = stats.sem(
+        dynamic_vals
+    )
+
+    dynamic_ci_half = (
+
+        stats.t.ppf(
+            0.975,
+            n - 1
+        )
+
+        *
+
+        dynamic_sem
+    )
+
+
+    first = subdf.iloc[0]
+
+
+    h_summary_rows.append({
+
+        "pair":
+            pair,
+
+        "material_pair":
+            first["material_pair"],
+
+        "delta_mu_s":
+            first["delta_mu_s"],
+
+        "delta_mu_d":
+            first["delta_mu_d"],
+
+        "N_participants":
+            n,
+
+
+        # ========================
+        # X axis
+        # ========================
+
+        "Mean_static_accuracy_percent":
+            static_mean,
+
+        "Static_SD":
+            static_sd,
+
+        "Static_SEM":
+            static_sem,
+
+        "Static_CI95_lower":
+            static_mean
+            -
+            static_ci_half,
+
+        "Static_CI95_upper":
+            static_mean
+            +
+            static_ci_half,
+
+        "Static_error_minus":
+            static_ci_half,
+
+        "Static_error_plus":
+            static_ci_half,
+
+
+        # ========================
+        # Y axis
+        # ========================
+
+        "Mean_dynamic_accuracy_percent":
+            dynamic_mean,
+
+        "Dynamic_SD":
+            dynamic_sd,
+
+        "Dynamic_SEM":
+            dynamic_sem,
+
+        "Dynamic_CI95_lower":
+            dynamic_mean
+            -
+            dynamic_ci_half,
+
+        "Dynamic_CI95_upper":
+            dynamic_mean
+            +
+            dynamic_ci_half,
+
+        "Dynamic_error_minus":
+            dynamic_ci_half,
+
+        "Dynamic_error_plus":
+            dynamic_ci_half
+    })
+
+
+fig2h_pair_summary = pd.DataFrame(
+    h_summary_rows
+)
+
+
+# ============================================================
+# 13. Optional: task advantage relative to diagonal x = y
+#
+# positive:
+# dynamic accuracy > static
+#
+# negative:
+# static accuracy > dynamic
+#
+# This is NOT the h-axis;
+# only useful as an auxiliary summary.
+# ============================================================
+
+fig2h_pair_summary[
+    "Dynamic_minus_Static_pp"
+] = (
+
+    fig2h_pair_summary[
+        "Mean_dynamic_accuracy_percent"
+    ]
+
+    -
+
+    fig2h_pair_summary[
+        "Mean_static_accuracy_percent"
+    ]
+)
+
+
+# ============================================================
+# 14. Export to Excel
+# ============================================================
+
+with pd.ExcelWriter(
+    output_file,
+    engine="openpyxl"
+) as writer:
+
+
+    # Full master data
+    master.to_excel(
+
+        writer,
+
+        sheet_name=
+        "Master_trials",
+
+        index=False
+    )
+
+
+    # Correctness audit
+    mismatch.to_excel(
+
+        writer,
+
+        sheet_name=
+        "Correct_check",
+
+        index=False
+    )
+
+
+    # =====================
+    # Fig. 2g
+    # =====================
+
+    fig2g_participant.to_excel(
+
+        writer,
+
+        sheet_name=
+        "Fig2g_participant",
+
+        index=False
+    )
+
+
+    fig2g_summary.to_excel(
+
+        writer,
+
+        sheet_name=
+        "Fig2g_summary",
+
+        index=False
+    )
+
+
+    fig2g_stats.to_excel(
+
+        writer,
+
+        sheet_name=
+        "Fig2g_stats",
+
+        index=False
+    )
+
+
+    # =====================
+    # Fig. 2h
+    # =====================
+
+    fig2h_participant_pair.to_excel(
+
+        writer,
+
+        sheet_name=
+        "Fig2h_participant_pair",
+
+        index=False
+    )
+
+
+    fig2h_pair_summary.to_excel(
+
+        writer,
+
+        sheet_name=
+        "Fig2h_pair_summary",
+
+        index=False
+    )
+
+
+# ============================================================
+# 15. Print results
+# ============================================================
+
+print("\n======================================")
+print("Fig. 2g")
+print("======================================")
+
+print(
+    fig2g_summary
+)
+
+print(
+    "\nMean paired gain =",
+    round(mean_gain, 2),
+    "pp"
+)
+
+print(
+    "95% CI =",
+    round(
+        mean_gain
+        -
+        ci_gain_half,
+        2
+    ),
+    "to",
+    round(
+        mean_gain
+        +
+        ci_gain_half,
+        2
+    ),
+    "pp"
+)
+
+print(
+    f"paired t({n-1}) = "
+    f"{t_result.statistic:.3f}, "
+    f"P = {t_result.pvalue:.3e}"
+)
+
+
+print("\n======================================")
+print("Fig. 2h")
+print("======================================")
+
+print(
+    fig2h_pair_summary[
+        [
+            "material_pair",
+
+            "Mean_static_accuracy_percent",
+            "Static_CI95_lower",
+            "Static_CI95_upper",
+
+            "Mean_dynamic_accuracy_percent",
+            "Dynamic_CI95_lower",
+            "Dynamic_CI95_upper",
+
+            "Dynamic_minus_Static_pp"
+        ]
+    ]
+)
+
+
+print("\n======================================")
+print("Analysis finished")
+print("Output file:")
+print(
+    os.path.abspath(
+        output_file
+    )
+)
+print("======================================")
