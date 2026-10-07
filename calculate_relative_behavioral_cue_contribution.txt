@@ -1,0 +1,528 @@
+# -*- coding: utf-8 -*-
+"""
+Calculate chance-corrected relative behavioral cue contributions
+from the raw static/dynamic friction recognition data.
+
+Designed for Anaconda / Spyder / Jupyter Python environments.
+
+Expected raw-data structure
+---------------------------
+One participant per worksheet (e.g. S1, S2, ... S20), with columns:
+subj, pair, matA, matB, order, task, context,
+delta_mu_s, delta_mu_d, correct, trial_idx, response, note
+
+Key definitions
+---------------
+A_d : accuracy for Dcue trials under S_equal
+A_s : accuracy for Scue trials under D_equal
+c   : chance level = 0.25, because responses can be AB / BA / AA / BB
+
+I_d = max((A_d - c) / (1 - c), 0)
+I_s = max((A_s - c) / (1 - c), 0)
+
+C_d = I_d / (I_d + I_s)
+C_s = I_s / (I_d + I_s)
+
+The recommended group values are the means of participant-level C_d and C_s.
+"""
+
+import os
+import numpy as np
+import pandas as pd
+
+
+# ============================================================
+# 1. USER SETTINGS
+# ============================================================
+
+# Change this to your raw Excel file name/path.
+INPUT_FILE = r"subject trail.xlsx"
+
+# Output Excel file.
+OUTPUT_FILE = r"relative_behavioral_cue_contribution.xlsx"
+
+# Four possible responses: AB, BA, AA, BB -> chance = 1/4
+CHANCE_LEVEL = 0.25
+
+# If True, scores below chance are treated as zero effective information.
+CLIP_BELOW_CHANCE = True
+
+
+# ============================================================
+# 2. HELPER FUNCTIONS
+# ============================================================
+
+def normalize_text(x):
+    """Convert a cell value to a clean uppercase string."""
+    if pd.isna(x):
+        return ""
+    return str(x).strip().upper()
+
+
+def chance_corrected_score(accuracy, chance=0.25, clip=True):
+    """
+    Convert raw accuracy to a chance-corrected information score.
+
+        I = (A - c) / (1 - c)
+
+    A = chance  -> I = 0
+    A = 1.0     -> I = 1
+
+    If clip=True, values below chance are set to 0.
+    """
+    if pd.isna(accuracy):
+        return np.nan
+
+    score = (accuracy - chance) / (1.0 - chance)
+
+    if clip:
+        score = max(score, 0.0)
+
+    return score
+
+
+def sem(values):
+    """Standard error of the mean."""
+    values = pd.Series(values).dropna()
+    if len(values) < 2:
+        return np.nan
+    return values.std(ddof=1) / np.sqrt(len(values))
+
+
+# ============================================================
+# 3. READ AND MERGE ALL PARTICIPANT SHEETS
+# ============================================================
+
+if not os.path.exists(INPUT_FILE):
+    raise FileNotFoundError(
+        f"Cannot find input file:\n{os.path.abspath(INPUT_FILE)}\n\n"
+        "Please put the Python script and Excel file in the same folder, "
+        "or change INPUT_FILE to the full file path."
+    )
+
+excel = pd.ExcelFile(INPUT_FILE)
+
+required_columns = {
+    "subj", "order", "task", "context", "response"
+}
+
+all_raw = []
+
+for sheet_name in excel.sheet_names:
+    df = pd.read_excel(INPUT_FILE, sheet_name=sheet_name)
+
+    # Remove completely empty rows.
+    df = df.dropna(how="all").copy()
+
+    missing = required_columns - set(df.columns)
+    if missing:
+        print(
+            f"[Skipped] Sheet '{sheet_name}' is missing columns: "
+            f"{sorted(missing)}"
+        )
+        continue
+
+    # Keep source-sheet information.
+    df["source_sheet"] = sheet_name
+
+    # Normalize important categorical columns.
+    df["order_clean"] = df["order"].apply(normalize_text)
+    df["response_clean"] = df["response"].apply(normalize_text)
+    df["task_clean"] = df["task"].apply(normalize_text)
+    df["context_clean"] = df["context"].apply(normalize_text)
+
+    # IMPORTANT:
+    # Recalculate correctness strictly from true order and participant response.
+    # Example: true AB -> only response AB is correct.
+    df["correct_recalc"] = (
+        df["order_clean"] == df["response_clean"]
+    ).astype(int)
+
+    # Compare with manually entered 'correct', if that column exists.
+    if "correct" in df.columns:
+        original_correct = pd.to_numeric(df["correct"], errors="coerce")
+        df["correct_mismatch"] = (
+            original_correct.notna()
+            & (original_correct != df["correct_recalc"])
+        ).astype(int)
+    else:
+        df["correct_mismatch"] = 0
+
+    all_raw.append(df)
+
+if not all_raw:
+    raise ValueError("No valid participant worksheets were found.")
+
+raw = pd.concat(all_raw, ignore_index=True)
+
+
+# ============================================================
+# 4. PARTICIPANT-LEVEL CALCULATION
+# ============================================================
+
+participant_rows = []
+
+for subject, sub in raw.groupby("subj", sort=False):
+
+    # Dynamic-friction diagnostic condition:
+    # dynamic-cue task + static friction approximately matched
+    dyn = sub[
+        (sub["task_clean"] == "DCUE")
+        & (sub["context_clean"] == "S_EQUAL")
+    ].copy()
+
+    # Static-friction diagnostic condition:
+    # static-cue task + dynamic friction approximately matched
+    sta = sub[
+        (sub["task_clean"] == "SCUE")
+        & (sub["context_clean"] == "D_EQUAL")
+    ].copy()
+
+    n_d = len(dyn)
+    n_s = len(sta)
+
+    A_d = dyn["correct_recalc"].mean() if n_d > 0 else np.nan
+    A_s = sta["correct_recalc"].mean() if n_s > 0 else np.nan
+
+    I_d = chance_corrected_score(
+        A_d, CHANCE_LEVEL, CLIP_BELOW_CHANCE
+    )
+    I_s = chance_corrected_score(
+        A_s, CHANCE_LEVEL, CLIP_BELOW_CHANCE
+    )
+
+    denominator = I_d + I_s if (pd.notna(I_d) and pd.notna(I_s)) else np.nan
+
+    if pd.notna(denominator) and denominator > 0:
+        C_d = I_d / denominator
+        C_s = I_s / denominator
+    else:
+        C_d = np.nan
+        C_s = np.nan
+
+    mismatch_count = int(sub["correct_mismatch"].sum())
+
+    participant_rows.append({
+        "subject": subject,
+
+        # Raw single-cue accuracies
+        "n_dynamic_trials": n_d,
+        "A_d_dynamic_accuracy": A_d,
+        "n_static_trials": n_s,
+        "A_s_static_accuracy": A_s,
+
+        # Chance correction
+        "chance_level_c": CHANCE_LEVEL,
+        "I_d_chance_corrected": I_d,
+        "I_s_chance_corrected": I_s,
+
+        # Final relative contribution
+        "C_d_dynamic_contribution": C_d,
+        "C_s_static_contribution": C_s,
+
+        # Quality control
+        "manual_correct_mismatches": mismatch_count
+    })
+
+participant_summary = pd.DataFrame(participant_rows)
+
+
+# ============================================================
+# 5. GROUP SUMMARY
+# ============================================================
+
+valid = participant_summary.dropna(
+    subset=["C_d_dynamic_contribution", "C_s_static_contribution"]
+).copy()
+
+N = len(valid)
+
+# Recommended values for the manuscript/figure:
+# mean of participant-level normalized contributions
+mean_Cd = valid["C_d_dynamic_contribution"].mean()
+mean_Cs = valid["C_s_static_contribution"].mean()
+
+sd_Cd = valid["C_d_dynamic_contribution"].std(ddof=1)
+sd_Cs = valid["C_s_static_contribution"].std(ddof=1)
+
+sem_Cd = sem(valid["C_d_dynamic_contribution"])
+sem_Cs = sem(valid["C_s_static_contribution"])
+
+# Approximate 95% CI based on mean ± 1.96*SEM
+ci95_low_Cd = mean_Cd - 1.96 * sem_Cd
+ci95_high_Cd = mean_Cd + 1.96 * sem_Cd
+ci95_low_Cs = mean_Cs - 1.96 * sem_Cs
+ci95_high_Cs = mean_Cs + 1.96 * sem_Cs
+
+
+# Also calculate pooled group accuracies as a descriptive check.
+A_d_pooled = raw.loc[
+    (raw["task_clean"] == "DCUE")
+    & (raw["context_clean"] == "S_EQUAL"),
+    "correct_recalc"
+].mean()
+
+A_s_pooled = raw.loc[
+    (raw["task_clean"] == "SCUE")
+    & (raw["context_clean"] == "D_EQUAL"),
+    "correct_recalc"
+].mean()
+
+I_d_pooled = chance_corrected_score(
+    A_d_pooled, CHANCE_LEVEL, CLIP_BELOW_CHANCE
+)
+I_s_pooled = chance_corrected_score(
+    A_s_pooled, CHANCE_LEVEL, CLIP_BELOW_CHANCE
+)
+
+pooled_denominator = I_d_pooled + I_s_pooled
+
+C_d_pooled = (
+    I_d_pooled / pooled_denominator
+    if pooled_denominator > 0 else np.nan
+)
+C_s_pooled = (
+    I_s_pooled / pooled_denominator
+    if pooled_denominator > 0 else np.nan
+)
+
+
+group_summary = pd.DataFrame([
+    {
+        "metric": "Participant-level mean relative contribution",
+        "N": N,
+        "dynamic": mean_Cd,
+        "static": mean_Cs,
+        "note": "RECOMMENDED for figure/manuscript; mean of individual C values"
+    },
+    {
+        "metric": "Participant-level SD",
+        "N": N,
+        "dynamic": sd_Cd,
+        "static": sd_Cs,
+        "note": ""
+    },
+    {
+        "metric": "Participant-level SEM",
+        "N": N,
+        "dynamic": sem_Cd,
+        "static": sem_Cs,
+        "note": ""
+    },
+    {
+        "metric": "Approx. 95% CI lower",
+        "N": N,
+        "dynamic": ci95_low_Cd,
+        "static": ci95_low_Cs,
+        "note": "mean - 1.96 × SEM"
+    },
+    {
+        "metric": "Approx. 95% CI upper",
+        "N": N,
+        "dynamic": ci95_high_Cd,
+        "static": ci95_high_Cs,
+        "note": "mean + 1.96 × SEM"
+    },
+    {
+        "metric": "Pooled raw diagnostic accuracy",
+        "N": N,
+        "dynamic": A_d_pooled,
+        "static": A_s_pooled,
+        "note": "A_d and A_s pooled across all eligible trials"
+    },
+    {
+        "metric": "Pooled chance-corrected information score",
+        "N": N,
+        "dynamic": I_d_pooled,
+        "static": I_s_pooled,
+        "note": "I=(A-c)/(1-c)"
+    },
+    {
+        "metric": "Pooled relative contribution",
+        "N": N,
+        "dynamic": C_d_pooled,
+        "static": C_s_pooled,
+        "note": "Descriptive only; not recommended as the main participant-level statistic"
+    }
+])
+
+
+# ============================================================
+# 6. LONG-FORM DATA FOR PLOTTING
+# ============================================================
+
+plot_data = pd.concat([
+    valid[["subject", "C_d_dynamic_contribution"]]
+        .rename(columns={"C_d_dynamic_contribution": "contribution"})
+        .assign(cue="Dynamic cues (mu_d)"),
+
+    valid[["subject", "C_s_static_contribution"]]
+        .rename(columns={"C_s_static_contribution": "contribution"})
+        .assign(cue="Static cues (mu_s)")
+], ignore_index=True)
+
+plot_data = plot_data[["subject", "cue", "contribution"]]
+
+
+# ============================================================
+# 7. DEFINITIONS / EQUATIONS SHEET
+# ============================================================
+
+definitions = pd.DataFrame([
+    ["c", "Chance level", "0.25 because four responses are allowed: AB, BA, AA, BB"],
+    ["A_d", "Dynamic diagnostic accuracy",
+     "Accuracy for task = Dcue and context = S_equal"],
+    ["A_s", "Static diagnostic accuracy",
+     "Accuracy for task = Scue and context = D_equal"],
+    ["I_d", "Chance-corrected dynamic information",
+     "max((A_d - c) / (1 - c), 0)"],
+    ["I_s", "Chance-corrected static information",
+     "max((A_s - c) / (1 - c), 0)"],
+    ["C_d", "Relative behavioral contribution of dynamic friction",
+     "I_d / (I_d + I_s)"],
+    ["C_s", "Relative behavioral contribution of static friction",
+     "I_s / (I_d + I_s)"],
+], columns=["symbol", "meaning", "calculation_or_definition"])
+
+
+# ============================================================
+# 8. EXPORT EXCEL
+# ============================================================
+
+with pd.ExcelWriter(OUTPUT_FILE, engine="xlsxwriter") as writer:
+
+    participant_summary.to_excel(
+        writer, sheet_name="participant_summary", index=False
+    )
+
+    group_summary.to_excel(
+        writer, sheet_name="group_summary", index=False
+    )
+
+    plot_data.to_excel(
+        writer, sheet_name="plot_data", index=False
+    )
+
+    raw.to_excel(
+        writer, sheet_name="raw_all_rechecked", index=False
+    )
+
+    definitions.to_excel(
+        writer, sheet_name="definitions", index=False
+    )
+
+    workbook = writer.book
+
+    # Common formats
+    header_fmt = workbook.add_format({
+        "bold": True,
+        "border": 1,
+        "align": "center",
+        "valign": "vcenter"
+    })
+
+    pct_fmt = workbook.add_format({
+        "num_format": "0.0%"
+    })
+
+    num_fmt = workbook.add_format({
+        "num_format": "0.000"
+    })
+
+    # participant_summary formatting
+    ws = writer.sheets["participant_summary"]
+    ws.freeze_panes(1, 1)
+    ws.set_row(0, 22, header_fmt)
+    ws.set_column("A:A", 10)
+    ws.set_column("B:B", 16)
+    ws.set_column("C:C", 22, pct_fmt)
+    ws.set_column("D:D", 16)
+    ws.set_column("E:E", 22, pct_fmt)
+    ws.set_column("F:F", 16, pct_fmt)
+    ws.set_column("G:H", 24, num_fmt)
+    ws.set_column("I:J", 28, pct_fmt)
+    ws.set_column("K:K", 25)
+
+    # group_summary formatting
+    ws = writer.sheets["group_summary"]
+    ws.freeze_panes(1, 0)
+    ws.set_row(0, 22, header_fmt)
+    ws.set_column("A:A", 42)
+    ws.set_column("B:B", 8)
+    ws.set_column("C:D", 18, pct_fmt)
+    ws.set_column("E:E", 70)
+
+    # plot_data formatting
+    ws = writer.sheets["plot_data"]
+    ws.freeze_panes(1, 0)
+    ws.set_row(0, 22, header_fmt)
+    ws.set_column("A:A", 12)
+    ws.set_column("B:B", 24)
+    ws.set_column("C:C", 18, pct_fmt)
+
+    # raw formatting
+    ws = writer.sheets["raw_all_rechecked"]
+    ws.freeze_panes(1, 0)
+    ws.set_row(0, 22, header_fmt)
+    ws.set_column(0, len(raw.columns) - 1, 14)
+
+    # definitions formatting
+    ws = writer.sheets["definitions"]
+    ws.set_row(0, 22, header_fmt)
+    ws.set_column("A:A", 10)
+    ws.set_column("B:B", 42)
+    ws.set_column("C:C", 65)
+
+    # Optional Excel chart using participant-level contributions
+    # The scatter/boxplot manuscript figure is still best made in Python/Origin,
+    # but this provides a quick visual check in the output workbook.
+    chart = workbook.add_chart({"type": "column"})
+    chart.add_series({
+        "name": "Dynamic",
+        "categories": ["group_summary", 0, 0, 0, 0],
+        "values": ["group_summary", 1, 2, 1, 2],
+    })
+    chart.add_series({
+        "name": "Static",
+        "categories": ["group_summary", 0, 0, 0, 0],
+        "values": ["group_summary", 1, 3, 1, 3],
+    })
+    chart.set_title({"name": "Mean relative behavioral cue contribution"})
+    chart.set_y_axis({
+        "name": "Relative contribution",
+        "min": 0,
+        "max": 1,
+        "num_format": "0%"
+    })
+    chart.set_legend({"position": "bottom"})
+    writer.sheets["group_summary"].insert_chart("G2", chart)
+
+
+# ============================================================
+# 9. PRINT MAIN RESULTS
+# ============================================================
+
+print("\n" + "=" * 68)
+print("RELATIVE BEHAVIORAL CUE CONTRIBUTION")
+print("=" * 68)
+
+print(f"Valid participants: N = {N}")
+print(f"Chance level: {CHANCE_LEVEL:.0%}")
+
+print("\nPooled diagnostic accuracies:")
+print(f"  A_d (Dcue & S_equal) = {A_d_pooled:.3f} ({A_d_pooled:.1%})")
+print(f"  A_s (Scue & D_equal) = {A_s_pooled:.3f} ({A_s_pooled:.1%})")
+
+print("\nRecommended participant-level group mean:")
+print(f"  Dynamic contribution C_d = {mean_Cd:.4f} ({mean_Cd:.1%})")
+print(f"  Static contribution  C_s = {mean_Cs:.4f} ({mean_Cs:.1%})")
+
+print("\nPooled descriptive contribution:")
+print(f"  Dynamic = {C_d_pooled:.4f} ({C_d_pooled:.1%})")
+print(f"  Static  = {C_s_pooled:.4f} ({C_s_pooled:.1%})")
+
+total_mismatch = participant_summary["manual_correct_mismatches"].sum()
+print(f"\nManual-vs-recalculated correct mismatches: {int(total_mismatch)}")
+
+print(f"\nExcel output saved to:\n{os.path.abspath(OUTPUT_FILE)}")
+print("=" * 68)

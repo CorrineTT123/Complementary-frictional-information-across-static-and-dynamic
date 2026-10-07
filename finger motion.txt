@@ -1,0 +1,313 @@
+import cv2
+import mediapipe as mp
+import numpy as np
+import csv
+from dataclasses import dataclass
+
+"""
+Finger tracking with click-to-select landmark (MediaPipe Hands).
+
+✅ Fixes:
+1) Click window ALWAYS appears once a hand is detected (no more "no popup").
+2) Exit condition: click to continue (no need to press any key).
+3) Uses REAL video FPS for time/speed/stops (works for 60 FPS, 120 FPS, etc.).
+4) Clear errors if no hand is detected.
+
+How to use:
+- Put your video path into VIDEO_PATH (or pass it via command line if you want to extend).
+- Run: python save_tracking_video_click_2.py
+- When the window shows your hand landmarks, click the fingertip/point you want to track.
+Outputs:
+- tracking_output.mp4 (overlay video)
+- finger_speed_data.csv (time, speed in px/s)
+"""
+
+# ===================== USER SETTINGS =====================
+VIDEO_PATH = "2.mp4"                 # <-- change to your video
+OUTPUT_VIDEO = "tracking_output.mp4"
+OUTPUT_CSV = "finger_speed_data.csv"
+
+# If your video file has wrong FPS metadata, you can force it here (e.g., 60.0). Otherwise keep None.
+FORCE_FPS = None
+
+# Tracking / detection parameters
+MAX_NUM_HANDS = 2
+MIN_DETECTION_CONF = 0.5
+MIN_TRACKING_CONF = 0.5
+
+# "Stop" definition (kept consistent with your old 30FPS logic):
+# Old logic: dist_per_frame < 4 px at 30 fps  => speed < 120 px/s
+STOP_SPEED_THRESHOLD_PX_PER_S = 120.0
+MIN_STOP_DURATION_S = 0.15  # must stay below threshold for this long to count as a stop
+
+# =========================================================
+
+mp_hands = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
+
+
+@dataclass
+class Selection:
+    ref_landmarks: list           # 21 landmarks (normalized) for the chosen hand on the selection frame
+    landmark_index: int           # which landmark to track (0-20)
+
+
+click_position = None
+
+
+def mouse_callback(event, x, y, flags, param):
+    global click_position
+    if event == cv2.EVENT_LBUTTONDOWN:
+        click_position = (x, y)
+        print(f"✅ Clicked at: {click_position}")
+
+
+def landmark_distance(lm1, lm2) -> float:
+    """Mean L2 distance in normalized (x,y) space across 21 landmarks."""
+    a = np.array([[p.x, p.y] for p in lm1], dtype=np.float32)
+    b = np.array([[p.x, p.y] for p in lm2], dtype=np.float32)
+    return float(np.mean(np.linalg.norm(a - b, axis=1)))
+
+
+def choose_landmark_by_click(hand_landmarks, click_xy, w, h) -> int:
+    """Return index of the landmark closest to click position."""
+    cx, cy = click_xy
+    best_i, best_d = 0, 1e18
+    for i, lm in enumerate(hand_landmarks.landmark):
+        x_px = int(lm.x * w)
+        y_px = int(lm.y * h)
+        d = (x_px - cx) ** 2 + (y_px - cy) ** 2
+        if d < best_d:
+            best_d = d
+            best_i = i
+    return best_i
+
+
+def get_video_fps(cap) -> float:
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if FORCE_FPS is not None and FORCE_FPS > 1:
+        return float(FORCE_FPS)
+    if fps is None or fps <= 1:
+        # Fallback: many phones/action cams are 60fps
+        return 60.0
+    return float(fps)
+
+
+def main():
+    global click_position
+
+    cap = cv2.VideoCapture(VIDEO_PATH)
+    if not cap.isOpened():
+        raise RuntimeError(f"❌ Cannot open video: {VIDEO_PATH}")
+
+    fps = get_video_fps(cap)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    if width <= 0 or height <= 0:
+        raise RuntimeError("❌ Failed to get video width/height.")
+
+    # ---------- Step 1: selection frame + click ----------
+    selection = None
+    click_position = None
+
+    with mp_hands.Hands(
+        static_image_mode=False,
+        max_num_hands=MAX_NUM_HANDS,
+        min_detection_confidence=MIN_DETECTION_CONF,
+        min_tracking_confidence=MIN_TRACKING_CONF,
+    ) as hands:
+
+        cv2.namedWindow("Click the fingertip/point to track")
+        cv2.setMouseCallback("Click the fingertip/point to track", mouse_callback)
+
+        found_hand_once = False
+
+        while cap.isOpened():
+            ok, frame = cap.read()
+            if not ok:
+                break
+
+            image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = hands.process(image_rgb)
+
+            annotated = frame.copy()
+
+            if results.multi_hand_landmarks:
+                found_hand_once = True
+                for hlm in results.multi_hand_landmarks:
+                    mp_drawing.draw_landmarks(
+                        annotated, hlm, mp_hands.HAND_CONNECTIONS
+                    )
+
+                # draw click dot if exists
+                if click_position is not None:
+                    cv2.circle(annotated, click_position, 6, (0, 0, 255), -1)
+
+                cv2.putText(
+                    annotated,
+                    "Click to select the point to track (ESC to cancel)",
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+
+                cv2.imshow("Click the fingertip/point to track", annotated)
+
+                key = cv2.waitKey(20) & 0xFF
+                if key == 27:  # ESC
+                    print("❌ Cancelled by user (ESC).")
+                    cap.release()
+                    cv2.destroyAllWindows()
+                    return
+
+                if click_position is not None:
+                    # choose which hand based on closest INDEX_FINGER_TIP to click (same as your old script)
+                    # then choose closest landmark index within that hand
+                    best_hand = None
+                    best_hand_dist = 1e18
+                    for hand in results.multi_hand_landmarks:
+                        tip = hand.landmark[8]
+                        tip_px = (int(tip.x * width), int(tip.y * height))
+                        d = (tip_px[0] - click_position[0]) ** 2 + (tip_px[1] - click_position[1]) ** 2
+                        if d < best_hand_dist:
+                            best_hand_dist = d
+                            best_hand = hand
+
+                    if best_hand is None:
+                        continue
+
+                    landmark_idx = choose_landmark_by_click(best_hand, click_position, width, height)
+                    selection = Selection(ref_landmarks=list(best_hand.landmark), landmark_index=landmark_idx)
+                    print(f"✅ Selected landmark index: {landmark_idx}")
+                    break
+            else:
+                # No hand detected on this frame
+                cv2.putText(
+                    annotated,
+                    "Detecting hand... (move hand into view)",
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+                cv2.imshow("Click the fingertip/point to track", annotated)
+                if cv2.waitKey(20) & 0xFF == 27:
+                    print("❌ Cancelled by user (ESC).")
+                    cap.release()
+                    cv2.destroyAllWindows()
+                    return
+
+        cv2.destroyWindow("Click the fingertip/point to track")
+
+        if selection is None:
+            if not found_hand_once:
+                raise RuntimeError("❌ No hand detected in the entire video. Please use a clearer video / closer hand.")
+            raise RuntimeError("❌ Selection failed (no click).")
+
+        # ---------- Step 2: restart video and track ----------
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        out = cv2.VideoWriter(OUTPUT_VIDEO, fourcc, fps, (width, height))
+
+        trajectory = []
+        last_point = None
+
+        stay_time = 0.0
+        move_time = 0.0
+
+        # Convert stop threshold speed to per-frame distance threshold
+        dist_threshold_px = STOP_SPEED_THRESHOLD_PX_PER_S / fps
+
+        min_stop_frames = max(1, int(round(MIN_STOP_DURATION_S * fps)))
+        stay_counter = 0
+        in_stop = False
+        total_stops = 0
+        stop_points = []
+
+        while cap.isOpened():
+            ok, frame = cap.read()
+            if not ok:
+                break
+
+            image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = hands.process(image_rgb)
+
+            if results.multi_hand_landmarks:
+                # choose the hand most similar to the reference hand (structure distance)
+                best_hand = None
+                best_d = 1e18
+                for hand in results.multi_hand_landmarks:
+                    d = landmark_distance(hand.landmark, selection.ref_landmarks)
+                    if d < best_d:
+                        best_d = d
+                        best_hand = hand
+
+                if best_hand is not None:
+                    lm = best_hand.landmark[selection.landmark_index]
+                    x_px = int(lm.x * width)
+                    y_px = int(lm.y * height)
+                    trajectory.append((x_px, y_px))
+
+                    mp_drawing.draw_landmarks(frame, best_hand, mp_hands.HAND_CONNECTIONS)
+                    cv2.circle(frame, (x_px, y_px), 8, (0, 0, 255), -1)
+
+                    # dwell / move logic
+                    if last_point is not None:
+                        dist = float(np.linalg.norm(np.array([x_px, y_px]) - np.array(last_point)))
+                        if dist < dist_threshold_px:
+                            stay_counter += 1
+                            stay_time += 1.0 / fps
+                            if stay_counter >= min_stop_frames and not in_stop:
+                                total_stops += 1
+                                stop_points.append((x_px, y_px))
+                                in_stop = True
+                        else:
+                            move_time += 1.0 / fps
+                            stay_counter = 0
+                            in_stop = False
+
+                    last_point = (x_px, y_px)
+
+            out.write(frame)
+
+        out.release()
+        cap.release()
+        cv2.destroyAllWindows()
+
+    # ---------- Step 3: save speed csv ----------
+    speed_data = []
+    if len(trajectory) >= 2:
+        speed_data.append((0.00, 0.00))
+        for i in range(1, len(trajectory)):
+            x1, y1 = trajectory[i - 1]
+            x2, y2 = trajectory[i]
+            distance = float(np.linalg.norm(np.array([x2, y2]) - np.array([x1, y1])))
+            speed = distance * fps  # px/s
+            t = i / fps
+            speed_data.append((round(t, 4), round(speed, 4)))
+    else:
+        speed_data = [(0.00, 0.00)]
+
+    with open(OUTPUT_CSV, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["time_s", "speed_px_per_s"])
+        writer.writerows(speed_data)
+
+    print(f"✅ Saved overlay video: {OUTPUT_VIDEO}")
+    print(f"✅ Saved speed curve csv: {OUTPUT_CSV}")
+    print(f"FPS used for analysis: {fps:.3f}")
+    print(f"Total stay time: {stay_time:.3f} s")
+    print(f"Total move time: {move_time:.3f} s")
+    print(f"Total stops: {total_stops}")
+    if len(stop_points) > 0:
+        print(f"First stop point (px): {stop_points[0]}")
+
+
+if __name__ == "__main__":
+    main()
